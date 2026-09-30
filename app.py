@@ -1,57 +1,38 @@
-from flask import Flask, jsonify, request
-import requests
-import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import html
+import os
+import re
 from urllib.parse import unquote
+
+import requests
+from flask import Flask, jsonify, request
 
 
 app = Flask(__name__)
-
-# 한글 JSON을 \uXXXX 형태가 아니라 그대로 표시
 app.json.ensure_ascii = False
 
 
-# ============================================================
-# AION2 기본 설정
-# ============================================================
-
 BASE_URL = "https://aion2.plaync.com"
 
-DEFAULT_NAME = "갹"
-DEFAULT_SERVER_ID = 2012
-DEFAULT_RACE = 2
+API_KEY = os.environ.get(
+    "AION2_API_KEY",
+    ""
+).strip()
+
+MAX_BATCH = 150
+MAX_WORKERS = 4
+TIMEOUT = 15
 
 
 USER_AGENT = (
-    "Mozilla/5.0 "
-    "(Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 "
-    "(KHTML, like Gecko) "
-    "Chrome/154.0.0.0 "
-    "Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/154.0.0.0 Safari/537.36"
 )
 
 
 # ============================================================
-# 공통 헤더
-# ============================================================
-
-def make_headers(referer=None):
-
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
-
-    if referer:
-        headers["Referer"] = referer
-
-    return headers
-
-
-# ============================================================
-# 검색 결과 캐릭터명 HTML 제거
+# 이름 정리
 # ============================================================
 
 def clean_name(value):
@@ -62,7 +43,57 @@ def clean_name(value):
         str(value or "")
     )
 
-    return html.unescape(value).strip()
+    return html.unescape(
+        value
+    ).strip()
+
+
+# ============================================================
+# 서버 ID -> 종족
+# ============================================================
+
+def infer_race(server_id):
+
+    server_id = int(
+        server_id
+    )
+
+    if 1000 <= server_id < 2000:
+        return 1
+
+    if 2000 <= server_id < 3000:
+        return 2
+
+    raise ValueError(
+        f"서버 ID로 종족을 판별할 수 없습니다: {server_id}"
+    )
+
+
+# ============================================================
+# NC 요청 헤더
+# ============================================================
+
+def make_headers(referer=None):
+
+    headers = {
+
+        "User-Agent":
+            USER_AGENT,
+
+        "Accept":
+            "application/json, text/plain, */*",
+
+        "Accept-Language":
+            "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
+    if referer:
+
+        headers["Referer"] = (
+            referer
+        )
+
+    return headers
 
 
 # ============================================================
@@ -71,476 +102,284 @@ def clean_name(value):
 
 def find_item_level(info):
 
-    if not isinstance(info, dict):
-        return None
-
-    stat = info.get("stat") or {}
-
-    stat_list = stat.get("statList") or []
+    stat_list = (
+        (info.get("stat") or {})
+        .get("statList")
+        or []
+    )
 
     for item in stat_list:
 
-        if not isinstance(item, dict):
+        if not isinstance(
+            item,
+            dict
+        ):
             continue
 
-        if item.get("type") == "ItemLevel":
-            return item.get("value")
+        if (
+            item.get("type") == "ItemLevel"
+            or
+            item.get("name") == "아이템레벨"
+        ):
+            return item.get(
+                "value"
+            )
 
     return None
 
 
 # ============================================================
-# AION2 캐릭터 검색
+# API KEY 확인
+#
+# Cloudtype 환경변수 AION2_API_KEY가 비어 있으면
+# 인증 없이 사용
 # ============================================================
 
-def search_character(
-    session,
+def authorized():
+
+    if not API_KEY:
+        return True
+
+    return (
+        request.headers.get(
+            "X-API-Key",
+            ""
+        )
+        == API_KEY
+    )
+
+
+# ============================================================
+# 캐릭터 조회
+# ============================================================
+
+def lookup_character(
     name,
-    server_id,
-    race
+    server_id
 ):
 
-    search_url = (
-        BASE_URL
-        + "/ko-kr/api/search/aion2/search/v2/character"
+    name = str(
+        name or ""
+    ).strip()
+
+    server_id = int(
+        server_id
     )
 
-    response = session.get(
-        search_url,
-        params={
-            "keyword": name,
-            "race": race,
-            "serverId": server_id,
-        },
-        headers=make_headers(
-            BASE_URL + "/ko-kr/"
-        ),
-        timeout=15,
-    )
+    if not name:
 
-    response.raise_for_status()
+        return {
 
-    data = response.json()
+            "success": False,
 
-    exact = None
+            "name":
+                name,
 
-    for item in data.get("list", []):
+            "serverId":
+                server_id,
 
-        item_name = clean_name(
-            item.get("name")
-        )
-
-        if item_name == name:
-
-            exact = item
-
-            break
-
-    return response, exact
-
-
-# ============================================================
-# AION2 캐릭터 상세 조회
-# ============================================================
-
-def get_character_data(
-    name,
-    server_id,
-    race
-):
-
-    result = {
-        "name": name,
-        "serverId": server_id,
-        "race": race,
-    }
-
-
-    session = requests.Session()
-
-
-    # ========================================================
-    # 1. 캐릭터 검색
-    # ========================================================
-
-    try:
-
-        search_response, exact = search_character(
-            session,
-            name,
-            server_id,
-            race
-        )
-
-        result["searchHttp"] = (
-            search_response.status_code
-        )
-
-        result["searchLength"] = len(
-            search_response.content
-        )
-
-    except Exception as e:
-
-        result["success"] = False
-
-        result["stage"] = "search"
-
-        result["error"] = str(e)
-
-        return result
-
-
-    if not exact:
-
-        result["success"] = False
-
-        result["stage"] = "search"
-
-        result["error"] = (
-            "정확히 일치하는 캐릭터를 찾지 못했습니다."
-        )
-
-        return result
-
-
-    raw_character_id = str(
-        exact.get("characterId") or ""
-    )
-
-
-    character_id = unquote(
-        raw_character_id
-    )
-
-
-    result["searchResult"] = {
-        "name": clean_name(
-            exact.get("name")
-        ),
-        "serverId": exact.get(
-            "serverId"
-        ),
-        "serverName": exact.get(
-            "serverName"
-        ),
-        "level": exact.get(
-            "level"
-        ),
-        "pcId": exact.get(
-            "pcId"
-        ),
-        "characterId": character_id,
-        "profileImageUrl": exact.get(
-            "profileImageUrl"
-        ),
-    }
-
-
-    # ========================================================
-    # 2. 캐릭터 정보실 페이지
-    # ========================================================
-
-    page_url = (
-        BASE_URL
-        + "/ko-kr/characters/"
-        + str(server_id)
-        + "/"
-        + raw_character_id
-    )
-
-
-    result["pageUrl"] = page_url
+            "error":
+                "캐릭터명이 비어 있습니다."
+        }
 
 
     try:
 
-        page_response = session.get(
-            page_url,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": (
-                    "text/html,"
-                    "application/xhtml+xml,"
-                    "application/xml;q=0.9,"
-                    "*/*;q=0.8"
-                ),
-                "Accept-Language":
-                    "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        race = infer_race(
+            server_id
+        )
+
+        session = (
+            requests.Session()
+        )
+
+
+        # ====================================================
+        # 1. 캐릭터 검색
+        # ====================================================
+
+        search_response = session.get(
+
+            BASE_URL
+            + "/ko-kr/api/search/aion2/search/v2/character",
+
+            params={
+                "keyword":
+                    name,
+
+                "race":
+                    race,
+
+                "serverId":
+                    server_id,
+
+                "page":
+                    1,
+
+                "size":
+                    40
             },
-            timeout=15,
+
+            headers=
+                make_headers(
+                    BASE_URL
+                    + "/ko-kr/"
+                ),
+
+            timeout=
+                TIMEOUT
         )
 
 
-        result["pageHttp"] = (
-            page_response.status_code
+        search_response.raise_for_status()
+
+
+        search_json = (
+            search_response.json()
         )
 
 
-        result["pageLength"] = len(
-            page_response.content
+        exact = None
+
+
+        for item in search_json.get(
+            "list",
+            []
+        ):
+
+            found_name = clean_name(
+                item.get("name")
+            )
+
+
+            if found_name == name:
+
+                exact = item
+                break
+
+
+        if (
+            not exact
+            or
+            not exact.get(
+                "characterId"
+            )
+        ):
+
+            return {
+
+                "success":
+                    False,
+
+                "name":
+                    name,
+
+                "serverId":
+                    server_id,
+
+                "error":
+                    "정확히 일치하는 캐릭터를 찾지 못했습니다."
+            }
+
+
+        character_id = unquote(
+            str(
+                exact.get(
+                    "characterId"
+                )
+            )
         )
 
 
-        page_text = page_response.text
-
-
-        geo_match = re.search(
-            r'_geolocationCountry\s*=\s*["\']([^"\']+)["\']',
-            page_text,
-            re.I,
-        )
-
-
-        country_match = re.search(
-            r'data-country\s*=\s*["\']([^"\']+)["\']',
-            page_text,
-            re.I,
-        )
-
-
-        result["geolocationCountry"] = (
-            geo_match.group(1)
-            if geo_match
-            else None
-        )
-
-
-        result["dataCountry"] = (
-            country_match.group(1)
-            if country_match
-            else None
-        )
-
-
-    except Exception as e:
-
-        result["pageError"] = str(e)
-
-
-    # ========================================================
-    # 공통 상세 API 파라미터
-    # ========================================================
-
-    params = {
-        "lang": "ko",
-        "characterId": character_id,
-        "serverId": server_id,
-    }
-
-
-    api_headers = make_headers(
-        page_url
-    )
-
-
-    # ========================================================
-    # 3. CHARACTER INFO
-    # ========================================================
-
-    info = None
-
-
-    try:
+        # ====================================================
+        # 2. 상세정보
+        # ====================================================
 
         info_response = session.get(
+
             BASE_URL
             + "/api/character/info",
-            params=params,
-            headers=api_headers,
-            timeout=15,
-        )
 
-
-        result["infoHttp"] = (
-            info_response.status_code
-        )
-
-
-        result["infoLength"] = len(
-            info_response.content
-        )
-
-
-        try:
-
-            info = info_response.json()
-
-        except Exception:
-
-            info = None
-
-
-        result["infoEmpty"] = (
-            not isinstance(info, dict)
-            or len(info) == 0
-        )
-
-
-        if (
-            not isinstance(info, dict)
-            or not info
-        ):
-
-            result["infoBody"] = (
-                info_response.text[:300]
-            )
-
-
-    except Exception as e:
-
-        result["infoError"] = str(e)
-
-
-    # ========================================================
-    # 4. EQUIPMENT
-    # ========================================================
-
-    equipment = None
-
-
-    try:
-
-        equipment_response = session.get(
-            BASE_URL
-            + "/api/character/equipment",
-            params=params,
-            headers=api_headers,
-            timeout=15,
-        )
-
-
-        result["equipmentHttp"] = (
-            equipment_response.status_code
-        )
-
-
-        result["equipmentLength"] = len(
-            equipment_response.content
-        )
-
-
-        try:
-
-            equipment = (
-                equipment_response.json()
-            )
-
-        except Exception:
-
-            equipment = None
-
-
-        result["equipmentEmpty"] = (
-            not isinstance(
-                equipment,
-                dict
-            )
-            or len(equipment) == 0
-        )
-
-
-        if (
-            not isinstance(
-                equipment,
-                dict
-            )
-            or not equipment
-        ):
-
-            result["equipmentBody"] = (
-                equipment_response.text[:300]
-            )
-
-
-    except Exception as e:
-
-        result["equipmentError"] = str(e)
-
-
-    # ========================================================
-    # 5. GAMEINFO CLASSES
-    # ========================================================
-
-    classes = None
-
-
-    try:
-
-        classes_response = session.get(
-            BASE_URL
-            + "/api/gameinfo/classes",
             params={
-                "lang": "ko"
+
+                "lang":
+                    "ko",
+
+                "characterId":
+                    character_id,
+
+                "serverId":
+                    server_id
             },
-            headers=make_headers(
-                BASE_URL + "/ko-kr/"
-            ),
-            timeout=15,
+
+            headers=
+                make_headers(
+                    BASE_URL
+                    + "/ko-kr/"
+                ),
+
+            timeout=
+                TIMEOUT
         )
 
 
-        result["classesHttp"] = (
-            classes_response.status_code
+        info_response.raise_for_status()
+
+
+        info = (
+            info_response.json()
         )
 
 
-        result["classesLength"] = len(
-            classes_response.content
-        )
-
-
-        try:
-
-            classes = (
-                classes_response.json()
-            )
-
-        except Exception:
-
-            classes = None
-
-
-        result["classesEmpty"] = (
+        if (
             not isinstance(
-                classes,
+                info,
                 dict
             )
-            or len(classes) == 0
-        )
+            or
+            not info
+        ):
 
+            return {
 
-    except Exception as e:
+                "success":
+                    False,
 
-        result["classesError"] = str(e)
+                "name":
+                    name,
 
+                "serverId":
+                    server_id,
 
-    # ========================================================
-    # 정상 데이터 추출
-    # ========================================================
+                "error":
+                    "AION2 상세 API가 빈 응답을 반환했습니다."
+            }
 
-    if (
-        isinstance(info, dict)
-        and info
-    ):
 
         profile = (
-            info.get("profile")
+            info.get(
+                "profile"
+            )
             or {}
         )
 
 
-        result["character"] = {
+        return {
+
+            "success":
+                True,
 
             "name":
                 profile.get(
                     "characterName"
-                ),
+                )
+                or name,
 
             "className":
                 profile.get(
                     "className"
-                ),
+                )
+                or "",
 
             "combatPower":
                 profile.get(
@@ -565,293 +404,405 @@ def get_character_data(
             "raceName":
                 profile.get(
                     "raceName"
-                ),
+                )
+                or "",
 
             "serverId":
                 profile.get(
                     "serverId"
-                ),
+                )
+                or server_id,
 
             "serverName":
                 profile.get(
                     "serverName"
-                ),
+                )
+                or exact.get(
+                    "serverName"
+                )
+                or "",
 
             "regionName":
                 profile.get(
                     "regionName"
-                ),
+                )
+                or "",
 
             "profileImage":
                 profile.get(
                     "profileImage"
-                ),
+                )
+                or ""
         }
 
 
-    # ========================================================
-    # 장비 개수
-    # ========================================================
+    except Exception as exc:
 
-    if (
-        isinstance(equipment, dict)
-        and equipment
-    ):
+        return {
 
-        equipment_data = (
-            equipment.get("equipment")
-            or {}
-        )
+            "success":
+                False,
 
+            "name":
+                name,
 
-        equipment_list = (
-            equipment_data.get(
-                "equipmentList"
-            )
-            or []
-        )
+            "serverId":
+                server_id,
 
-
-        result["equipmentCount"] = len(
-            equipment_list
-        )
-
-
-    # ========================================================
-    # 최종 성공 여부
-    # ========================================================
-
-    info_ok = (
-        result.get("infoHttp") == 200
-        and result.get("infoEmpty") is False
-    )
-
-
-    equipment_ok = (
-        result.get("equipmentHttp") == 200
-        and result.get(
-            "equipmentEmpty"
-        ) is False
-    )
-
-
-    classes_ok = (
-        result.get("classesHttp") == 200
-        and result.get(
-            "classesEmpty"
-        ) is False
-    )
-
-
-    result["success"] = (
-        info_ok
-        and equipment_ok
-        and classes_ok
-    )
-
-
-    if result["success"]:
-
-        result["diagnosis"] = (
-            "AWS Seoul에서 "
-            "AION2 공식 API 정상 응답"
-        )
-
-    else:
-
-        result["diagnosis"] = (
-            "AION2 공식 API가 "
-            "빈 응답 또는 제한됨"
-        )
-
-
-    return result
+            "error":
+                str(exc)
+        }
 
 
 # ============================================================
-# 메인 페이지
+# 인증
 # ============================================================
 
-@app.route("/")
+@app.before_request
+def check_api_key():
+
+    if request.path == "/":
+
+        return None
+
+
+    if not authorized():
+
+        return jsonify({
+
+            "success":
+                False,
+
+            "error":
+                "Unauthorized"
+
+        }), 401
+
+
+    return None
+
+
+# ============================================================
+# 서버 상태
+# ============================================================
+
+@app.get("/")
 def home():
 
     return jsonify({
-        "status": "ok",
-        "service": "AION2 Legion API",
-        "message": "서버가 정상 실행 중입니다.",
-        "testUrl": "/test",
-        "characterExample":
-            "/character?name=갹&serverId=2012&race=2"
+
+        "status":
+            "ok",
+
+        "service":
+            "AION2 Legion API"
     })
 
 
 # ============================================================
-# 고정 테스트
+# 캐릭터 1명 조회
 #
-# 갹 / 울고른 / 마족
+# /character?name=갹&serverId=2012
 # ============================================================
 
-@app.route("/test")
-def test():
-
-    result = get_character_data(
-        DEFAULT_NAME,
-        DEFAULT_SERVER_ID,
-        DEFAULT_RACE
-    )
-
-    status_code = (
-        200
-        if result.get("success")
-        else 502
-    )
-
-    return jsonify(
-        result
-    ), status_code
-
-
-# ============================================================
-# 실제 캐릭터 조회
-#
-# 예:
-# /character?name=갹&serverId=2012&race=2
-# ============================================================
-
-@app.route("/character")
+@app.get("/character")
 def character():
 
-    name = str(
-        request.args.get(
-            "name",
-            ""
-        )
+    name = request.args.get(
+        "name",
+        ""
     ).strip()
 
 
-    server_id_text = str(
-        request.args.get(
-            "serverId",
-            ""
-        )
+    server_id = request.args.get(
+        "serverId",
+        ""
     ).strip()
 
 
-    race_text = str(
-        request.args.get(
-            "race",
-            ""
-        )
-    ).strip()
-
-
-    if not name:
+    if (
+        not name
+        or
+        not server_id
+    ):
 
         return jsonify({
-            "success": False,
-            "error": "name 값이 필요합니다."
+
+            "success":
+                False,
+
+            "error":
+                "name과 serverId가 필요합니다."
+
         }), 400
 
 
     try:
 
-        server_id = int(
-            server_id_text
+        result = lookup_character(
+
+            name,
+
+            int(
+                server_id
+            )
         )
 
-    except Exception:
+
+    except ValueError:
 
         return jsonify({
-            "success": False,
-            "error": (
+
+            "success":
+                False,
+
+            "error":
                 "serverId가 올바르지 않습니다."
-            )
+
         }), 400
-
-
-    # race 값을 생략한 경우
-    # 1000번대 = 천족
-    # 2000번대 = 마족
-    if race_text:
-
-        try:
-
-            race = int(
-                race_text
-            )
-
-        except Exception:
-
-            return jsonify({
-                "success": False,
-                "error": (
-                    "race가 올바르지 않습니다."
-                )
-            }), 400
-
-    else:
-
-        if (
-            1000 <= server_id < 2000
-        ):
-
-            race = 1
-
-        elif (
-            2000 <= server_id < 3000
-        ):
-
-            race = 2
-
-        else:
-
-            return jsonify({
-                "success": False,
-                "error": (
-                    "서버 ID로 종족을 "
-                    "판별할 수 없습니다."
-                )
-            }), 400
-
-
-    result = get_character_data(
-        name,
-        server_id,
-        race
-    )
-
-
-    status_code = (
-        200
-        if result.get("success")
-        else 502
-    )
 
 
     return jsonify(
         result
-    ), status_code
+    ), (
+        200
+        if result.get(
+            "success"
+        )
+        else 404
+    )
 
 
 # ============================================================
-# 헬스 체크
+# 여러 캐릭터 일괄 조회
+#
+# POST /batch
+#
+# {
+#   "characters": [
+#     {"name":"갹","serverId":2012}
+#   ]
+# }
 # ============================================================
 
-@app.route("/health")
-def health():
+@app.post("/batch")
+def batch():
+
+    body = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
+
+
+    characters = (
+        body.get(
+            "characters"
+        )
+        or []
+    )
+
+
+    if not isinstance(
+        characters,
+        list
+    ):
+
+        return jsonify({
+
+            "success":
+                False,
+
+            "error":
+                "characters는 배열이어야 합니다."
+
+        }), 400
+
+
+    if (
+        len(
+            characters
+        )
+        > MAX_BATCH
+    ):
+
+        return jsonify({
+
+            "success":
+                False,
+
+            "error":
+                f"한 번에 최대 {MAX_BATCH}명까지 조회할 수 있습니다."
+
+        }), 400
+
+
+    jobs = []
+
+
+    for index, item in enumerate(
+        characters
+    ):
+
+        if not isinstance(
+            item,
+            dict
+        ):
+            continue
+
+
+        name = str(
+            item.get(
+                "name"
+            )
+            or ""
+        ).strip()
+
+
+        server_id = item.get(
+            "serverId"
+        )
+
+
+        if (
+            not name
+            or
+            server_id is None
+        ):
+            continue
+
+
+        try:
+
+            jobs.append((
+
+                index,
+
+                name,
+
+                int(
+                    server_id
+                )
+            ))
+
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            continue
+
+
+    results_by_index = {}
+
+
+    with ThreadPoolExecutor(
+        max_workers=
+            MAX_WORKERS
+    ) as executor:
+
+
+        future_map = {
+
+            executor.submit(
+
+                lookup_character,
+
+                name,
+
+                server_id
+
+            ): index
+
+            for (
+                index,
+                name,
+                server_id
+            )
+            in jobs
+        }
+
+
+        for future in as_completed(
+            future_map
+        ):
+
+            index = (
+                future_map[
+                    future
+                ]
+            )
+
+
+            try:
+
+                results_by_index[
+                    index
+                ] = (
+                    future.result()
+                )
+
+
+            except Exception as exc:
+
+                results_by_index[
+                    index
+                ] = {
+
+                    "success":
+                        False,
+
+                    "error":
+                        str(exc)
+                }
+
+
+    results = [
+
+        results_by_index[
+            index
+        ]
+
+        for (
+            index,
+            _,
+            _
+        )
+        in jobs
+
+        if index
+        in results_by_index
+    ]
+
 
     return jsonify({
-        "ok": True
+
+        "success":
+            True,
+
+        "count":
+            len(
+                results
+            ),
+
+        "results":
+            results
     })
 
 
 # ============================================================
-# 로컬 직접 실행
+# 직접 실행
 # ============================================================
 
 if __name__ == "__main__":
 
     app.run(
-        host="0.0.0.0",
-        port=5000
+
+        host=
+            "0.0.0.0",
+
+        port=
+            5000
     )
