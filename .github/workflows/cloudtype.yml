@@ -1,0 +1,148 @@
+name: Deploy to cloudtype
+
+on:
+  push:
+    branches:
+      - main
+
+  # 1시간마다 서버 상태 확인
+  schedule:
+    - cron: '15 * * * *'
+
+  # GitHub에서 수동 실행 버튼도 활성화
+  workflow_dispatch:
+
+concurrency:
+  group: aion2-cloudtype-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # =====================================================
+      # 저장소 가져오기
+      # =====================================================
+      - name: Checkout
+        uses: actions/checkout@v4
+
+
+      # =====================================================
+      # 예약 실행일 때만 Cloudtype 서버 상태 확인
+      #
+      # push 또는 수동 실행일 때는 상태 확인 없이 배포
+      # =====================================================
+      - name: Check AION2 API server
+        id: health
+        if: github.event_name == 'schedule'
+        shell: bash
+        run: |
+          URL="https://port-0-aion2-api-muo5wdhf0612cecf.sel3.cloudtype.app/"
+
+          echo "Cloudtype 서버 상태 확인"
+          echo "$URL"
+
+          STATUS="000"
+
+          for i in 1 2 3
+          do
+            STATUS=$(curl \
+              -L \
+              -sS \
+              -o /dev/null \
+              -w "%{http_code}" \
+              --connect-timeout 10 \
+              --max-time 20 \
+              "$URL" || true)
+
+            echo "확인 $i / HTTP $STATUS"
+
+            if [ "$STATUS" = "200" ]; then
+              break
+            fi
+
+            sleep 5
+          done
+
+          if [ "$STATUS" = "200" ]; then
+
+            echo "Cloudtype 서버 정상"
+            echo "alive=true" >> "$GITHUB_OUTPUT"
+
+          else
+
+            echo "Cloudtype 서버 중지 또는 접속 불가"
+            echo "alive=false" >> "$GITHUB_OUTPUT"
+
+          fi
+
+
+      # =====================================================
+      # Cloudtype 연결
+      #
+      # 아래 경우에만 실행
+      #
+      # 1. main 브랜치 push
+      # 2. 수동 실행
+      # 3. 예약 검사에서 서버가 죽어 있음
+      # =====================================================
+      - name: Connect deploy key
+        if: >
+          github.event_name != 'schedule' ||
+          steps.health.outputs.alive != 'true'
+        uses: cloudtype-github-actions/connect@v1
+        with:
+          token: ${{ secrets.CLOUDTYPE_TOKEN }}
+          ghtoken: ${{ secrets.GHP_TOKEN }}
+
+
+      # =====================================================
+      # Cloudtype 배포
+      # =====================================================
+      - name: Deploy
+        if: >
+          github.event_name != 'schedule' ||
+          steps.health.outputs.alive != 'true'
+        uses: cloudtype-github-actions/deploy@v1
+        with:
+          token: ${{ secrets.CLOUDTYPE_TOKEN }}
+
+          project: mikicos81/aion2-legion-api
+
+          stage: main
+
+          yaml: |
+            name: aion2-api
+
+            app: python@3.9
+
+            options:
+              env:
+                - name: FLASK_ENV
+                  value: production
+
+              ports: 5000
+
+              start: gunicorn -b 0.0.0.0:5000 app:app
+
+              buildenv: []
+
+            context:
+              git:
+                url: git@github.com:${{ github.repository }}.git
+                ref: refs/heads/main
+
+              preset: python-flask
+
+
+      # =====================================================
+      # 정상이라 재배포가 필요 없는 경우
+      # =====================================================
+      - name: Server already running
+        if: >
+          github.event_name == 'schedule' &&
+          steps.health.outputs.alive == 'true'
+        run: |
+          echo "AION2 Cloudtype 서버가 정상 실행 중입니다."
+          echo "재배포하지 않습니다."
